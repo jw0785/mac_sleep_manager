@@ -11,6 +11,7 @@ PERMISSION="tty"             # permission {none, tty} - prevent sleep if active 
 # Internal State Variables
 STATE="awake"
 BATTERY_AT_SLEEP=100
+DARKWAKE_SENT=0
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -52,12 +53,14 @@ hibernate_now() {
     sudo pmset -a standbydelaylow 0
     sudo pmset -a standbydelayhigh 0
     sudo pmset -a hibernatemode 25
+    sleep 5
     sudo pmset sleepnow
     STATE="sleeping"
 }
 sleep_now() {
     log_msg "Initiating sleep..."
     pmset -a hibernatemode 3
+    sleep 5
     pmset sleepnow
     STATE="sleeping"
 }
@@ -95,6 +98,7 @@ while true; do
             BATT_DROP=$(( BATTERY_AT_SLEEP - BATT ))
             if [[ "$BATT_DROP" -ge "$THRESHOLD_PERCENT" ]]; then
                 log_msg "Battery dropped by $BATT_DROP%. Hibernating."
+                sleep 30 # wait for VM settle
                 if [[ "$THRESHOLD_RESPONSE" == "hibernate" ]]; then
                     hibernate_now
                 else
@@ -102,7 +106,13 @@ while true; do
                 fi
             else
                 # Not enough drain yet, but re-sleep in case of phantom wake like t2 macbook touchbar
-                pmset sleepnow
+                # handle darkwake here
+                if [[ "$DARKWAKE_SENT" -eq 0 ]]; then
+                    log_msg "Darkwake detected. Waiting 30s to settle before sleep."
+                    sleep 30
+                    pmset sleepnow
+                    DARKWAKE_SENT=1
+                fi
             fi
         elif [[ "$STATE" == "awake" ]]; then
            # Display off but we never initiated sleep — lid was closed
@@ -123,6 +133,7 @@ while true; do
         if [[ "$STATE" == "sleeping" ]]; then
             log_msg "System woke up."
             STATE="awake"
+            DARKWAKE_SENT=0
             sudo pmset -a hibernatemode 3
             sudo pmset -a standbydelaylow 10800
             sudo pmset -a standbydelayhigh 86400
