@@ -21,7 +21,14 @@ get_idle_time() {
 }
 # use ioreg to avoid stale data
 get_battery_level() {
-    ioreg -r -n AppleSmartBattery | awk '/CurrentCapacity/{cap=$NF} /MaxCapacity/{max=$NF} END{if(max>0) printf "%d", (cap/max)*100}'
+    # Try raw SMC read first
+    local cap=$(ioreg -r -n AppleSmartBattery | awk '/CurrentCapacity/{print $NF; exit}')
+    local max=$(ioreg -r -n AppleSmartBattery | awk '/MaxCapacity/{print $NF; exit}')
+    if [[ -n "$cap" && -n "$max" && "$max" -gt 0 ]]; then
+        echo $(( cap * 100 / max ))
+    else
+        echo ""
+    fi
 }
 is_on_ac() {
     pmset -g batt | grep -q "AC Power"
@@ -50,10 +57,21 @@ has_active_tty() {
 }
 hibernate_now() {
     log_msg "Initiating hibernate..."
+    if ! is_display_asleep; then
+        log_msg "Display on, aborting hibernate."
+        return 1
+    fi
     sudo pmset -a standbydelaylow 0
     sudo pmset -a standbydelayhigh 0
     sudo pmset -a hibernatemode 25
     sleep 5
+    if ! is_display_asleep; then
+        log_msg "User woke during hibernate prep. Restoring defaults."
+        sudo pmset -a hibernatemode 3
+        sudo pmset -a standbydelaylow 10800
+        sudo pmset -a standbydelayhigh 86400
+        return 1
+    fi
     sudo pmset sleepnow
     STATE="sleeping"
 }
@@ -65,7 +83,14 @@ sleep_now() {
     STATE="sleeping"
 }
 log_msg "Starting Sleep Manager..."
-
+# Check if Intel Mac laptop to set GPU preference to reduce power usage
+MACHINE_MODEL=$(sysctl -n hw.model)
+if [[ "$MACHINE_MODEL" == MacBook* ]] || [[ "$MACHINE_MODEL" == MacBookPro* ]] || [[ "$MACHINE_MODEL" == MacBookAir* ]]; then
+    if ! sysctl hw.optional.arm64 2>/dev/null | grep -q ": 1"; then
+        log_msg "Intel Mac detected. Setting GPU preference to integrated."
+        sudo pmset -a gpuswitch 0
+    fi
+fi
 while true; do
     sleep $TIME_RESOLUTION
     
@@ -99,18 +124,26 @@ while true; do
             if [[ "$BATT_DROP" -ge "$THRESHOLD_PERCENT" ]]; then
                 log_msg "Battery dropped by $BATT_DROP%. Hibernating."
                 sleep 30 # wait for VM settle
-                if [[ "$THRESHOLD_RESPONSE" == "hibernate" ]]; then
-                    hibernate_now
+               	if is_display_asleep; then
+	                if [[ "$THRESHOLD_RESPONSE" == "hibernate" ]]; then
+	                    hibernate_now
+	                else
+	                    sleep_now
+	                fi
                 else
-                    sleep_now
-                fi
+                	log_msg "Aborted re-sleep, display is on (user woke system)."
+               	fi
             else
                 # Not enough drain yet, but re-sleep in case of phantom wake like t2 macbook touchbar
                 # handle darkwake here
                 if [[ "$DARKWAKE_SENT" -eq 0 ]]; then
                     log_msg "Darkwake detected. Waiting 30s to settle before sleep."
-                    sleep 30
-                    pmset sleepnow
+				    sleep 30
+				    if is_display_asleep; then
+				        pmset sleepnow
+				    else
+				        log_msg "Aborted re-sleep, display is on (user woke system)."
+				    fi
                     DARKWAKE_SENT=1
                 fi
             fi
