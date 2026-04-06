@@ -5,9 +5,10 @@ IDLE_TIME_SEC=900            # idle_time
 TIME_RESOLUTION=60           # time_resolution
 THRESHOLD_PERCENT=15         # threshold (battery drop % during sleep to trigger hibernate)
 LOW_BATTERY_THRESHOLD=20     # low_battery_threshold
+# TODO: add time threshold on battery
 THRESHOLD_RESPONSE="hibernate" # threshold_response (hibernate or sleep)
 PERMISSION="tty"             # permission {none, tty} - prevent sleep if active tty/ssh exists
-
+is_tcp_keepalive=false
 # Internal State Variables
 STATE="awake"
 BATTERY_AT_SLEEP=100
@@ -90,6 +91,11 @@ if [[ "$MACHINE_MODEL" == MacBook* ]] || [[ "$MACHINE_MODEL" == MacBookPro* ]] |
         log_msg "Intel Mac detected. Setting GPU preference to integrated."
         sudo pmset -a gpuswitch 0
     fi
+fi
+# toggle tcp keepalive on battery if disabled
+if [[ "$is_tcp_keepalive" == false ]]; then
+    log_msg "Disabling TCP keepalive to prevent phantom wakes."
+    sudo pmset -b tcpkeepalive 0
 fi
 while true; do
     sleep $TIME_RESOLUTION
