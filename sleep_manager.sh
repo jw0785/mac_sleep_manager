@@ -176,6 +176,10 @@ while true; do
             sudo pmset -a hibernatemode 3
             sudo pmset -a standbydelaylow 10800
             sudo pmset -a standbydelayhigh 86400
+            # Restart CoreAudio daemon
+            # coreaudiod fails to resync its ring buffer positions after
+            # hibernate (mode 25) wake, causing a ~536M frame offset
+            sudo killall coreaudiod 2>/dev/null && log_msg "Restarted coreaudiod."
         fi
     fi
     # Block sleeping if there is an active TTY session and permissions require it
