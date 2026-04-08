@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# need to know
+# macos rely on EC.RTC for almost every maintenance task. there's only so much i can do.
+
 # Configuration
 IDLE_TIME_SEC=900            # idle_time
 TIME_RESOLUTION=60           # time_resolution
@@ -9,6 +12,9 @@ LOW_BATTERY_THRESHOLD=20     # low_battery_threshold
 THRESHOLD_RESPONSE="hibernate" # threshold_response (hibernate or sleep)
 PERMISSION="tty"             # permission {none, tty} - prevent sleep if active tty/ssh exists
 is_tcp_keepalive=false
+# darkwake, sched related
+is_calaccessd_allowed=true          # necessary for calendar time to leave. unless you don't use icalendar.
+is_analytics_allowed=false
 # Internal State Variables
 STATE="awake"
 BATTERY_AT_SLEEP=100
@@ -96,6 +102,26 @@ fi
 if [[ "$is_tcp_keepalive" == false ]]; then
     log_msg "Disabling TCP keepalive to prevent phantom wakes."
     sudo pmset -b tcpkeepalive 0
+fi
+# toggle calendar access daemon darkwake if disabled
+if [[ "$is_calaccessd_allowed" == false ]]; then
+    log_msg "Disabling calaccessd to prevent calendar events from scheduling darkwake"
+    console_uid=$(stat -f %u /dev/console)
+    if [[ "$console_uid" == "0" || -z "$console_uid" ]]; then
+        log_msg "No GUI user logged in; skipping calaccessd toggle."
+    else
+        launchctl disable "gui/${console_uid}/com.apple.calaccessd"
+        # launchctl bootout  "gui/${console_uid}/com.apple.calaccessd" 2>/dev/null
+        # SIP blocks bootout
+        sudo killall calaccessd 2>/dev/null && log_msg "Stopped calaccessd."
+    fi
+fi
+if [[ "$is_analytics_allowed" == false ]]; then
+    log_msg "Disabling analyticsd to prevent analytics events from waking the system."
+    # "Share Mac Analytics" osanalyticshelper
+    sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit -bool false
+    # "Share with App Developers" third-party crash report
+    sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit -bool false
 fi
 while true; do
     sleep $TIME_RESOLUTION
