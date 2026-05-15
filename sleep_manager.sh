@@ -15,10 +15,11 @@ is_tcp_keepalive=false
 # darkwake, sched related
 is_calaccessd_allowed=true          # necessary for calendar time to leave. unless you don't use icalendar.
 is_analytics_allowed=false
+## extra
+is_lessbright_allowed=false
 # Internal State Variables
 STATE="awake"
 BATTERY_AT_SLEEP=100
-DARKWAKE_SENT=0
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -62,15 +63,39 @@ has_active_tty() {
     fi
     return 1
 }
+pause_media() {
+    log_msg "Pausing known media players..."
+    # native pause
+    osascript -e 'ignoring application responses' \
+              -e 'tell application "System Events"' \
+              -e '  if exists (processes where name is "VLC") then tell application "VLC" to stop' \
+              -e '  if exists (processes where name is "Spotify") then tell application "Spotify" to pause' \
+              -e 'end tell' \
+              -e 'end ignoring' >/dev/null 2>&1
+
+    # pause known process ignoring that.
+    if pgrep -x "mpv" > /dev/null; then
+        log_msg "mpv detected. Attempting to pause or kill."
+        # Try to send media pause key
+        osascript -e 'tell application "System Events" to key code 100'
+        # TODO: test if sigterm is necessary
+        # killall -TERM mpv
+    fi
+}
+
 hibernate_now() {
     log_msg "Initiating hibernate..."
     if ! is_display_asleep; then
         log_msg "Display on, aborting hibernate."
         return 1
     fi
+    pause_media
     sudo pmset -a standbydelaylow 0
+    sudo pmset -b networkoversleep 0
     sudo pmset -a standbydelayhigh 0
     sudo pmset -a hibernatemode 25
+    sudo pmset -b powernap 0
+    sudo pmset -b womp 0
     sleep 5
     if ! is_display_asleep; then
         log_msg "User woke during hibernate prep. Restoring defaults."
@@ -84,9 +109,12 @@ hibernate_now() {
 }
 sleep_now() {
     log_msg "Initiating sleep..."
-    pmset -a hibernatemode 3
+    pause_media
+    sudo pmset -a hibernatemode 3
+    sudo pmset -b powernap 0
+    sudo pmset -b womp 0
     sleep 5
-    pmset sleepnow
+    sudo pmset sleepnow
     STATE="sleeping"
 }
 log_msg "Starting Sleep Manager..."
@@ -102,6 +130,7 @@ fi
 if [[ "$is_tcp_keepalive" == false ]]; then
     log_msg "Disabling TCP keepalive to prevent phantom wakes."
     sudo pmset -b tcpkeepalive 0
+    sudo pmset -b networkoversleep 0
 fi
 # toggle calendar access daemon darkwake if disabled
 if [[ "$is_calaccessd_allowed" == false ]]; then
@@ -122,6 +151,11 @@ if [[ "$is_analytics_allowed" == false ]]; then
     sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit -bool false
     # "Share with App Developers" third-party crash report
     sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit -bool false
+fi
+## extra features
+if [[ "$is_lessbright_allowed" == false ]]; then
+    log_msg "Disabling dim screen on battery."
+    sudo pmset -b lessbright 0
 fi
 while true; do
     sleep $TIME_RESOLUTION
@@ -168,15 +202,12 @@ while true; do
             else
                 # Not enough drain yet, but re-sleep in case of phantom wake like t2 macbook touchbar
                 # handle darkwake here
-                if [[ "$DARKWAKE_SENT" -eq 0 ]]; then
-                    log_msg "Darkwake detected. Waiting 30s to settle before sleep."
-				    sleep 30
-				    if is_display_asleep; then
-				        pmset sleepnow
-				    else
-				        log_msg "Aborted re-sleep, display is on (user woke system)."
-				    fi
-                    DARKWAKE_SENT=1
+                log_msg "Darkwake detected. Waiting 30s to settle before sleep."
+                sleep 30
+                if is_display_asleep; then
+                    pmset sleepnow
+                else
+                    log_msg "Aborted re-sleep, display is on (user woke system)."
                 fi
             fi
         elif [[ "$STATE" == "awake" ]]; then
@@ -198,7 +229,6 @@ while true; do
         if [[ "$STATE" == "sleeping" ]]; then
             log_msg "System woke up."
             STATE="awake"
-            DARKWAKE_SENT=0
             sudo pmset -a hibernatemode 3
             sudo pmset -a standbydelaylow 10800
             sudo pmset -a standbydelayhigh 86400
