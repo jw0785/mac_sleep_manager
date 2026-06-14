@@ -94,6 +94,20 @@ pause_media() {
     fi
 }
 
+enforce_pmset() {
+    sudo pmset -a hibernatemode 3
+    sudo pmset -a standbydelaylow 10800
+    sudo pmset -a standbydelayhigh 86400
+    sudo pmset -b powernap 0
+    sudo pmset -b womp 0
+    if [[ "$is_tcp_keepalive" == false ]]; then
+        sudo pmset -b tcpkeepalive 0
+        sudo pmset -b networkoversleep 0
+    fi
+    if [[ "$is_lessbright_allowed" == false ]]; then
+        sudo pmset -b lessbright 0
+    fi
+}
 hibernate_now() {
     log_msg "Initiating hibernate..."
     if is_full_wake; then
@@ -141,13 +155,7 @@ if [[ "$MACHINE_MODEL" == MacBook* ]] || [[ "$MACHINE_MODEL" == MacBookPro* ]] |
         sudo pmset -a gpuswitch 0
     fi
 fi
-# toggle tcp keepalive on battery if disabled
-if [[ "$is_tcp_keepalive" == false ]]; then
-    log_msg "Disabling TCP keepalive to prevent phantom wakes."
-    sudo pmset -b tcpkeepalive 0
-    sudo pmset -b networkoversleep 0
-fi
-# toggle calendar access daemon darkwake if disabled
+# one-time init that only needs to run at daemon start
 if [[ "$is_calaccessd_allowed" == false ]]; then
     log_msg "Disabling calaccessd to prevent calendar events from scheduling darkwake"
     console_uid=$(stat -f %u /dev/console)
@@ -155,23 +163,16 @@ if [[ "$is_calaccessd_allowed" == false ]]; then
         log_msg "No GUI user logged in; skipping calaccessd toggle."
     else
         launchctl disable "gui/${console_uid}/com.apple.calaccessd"
-        # launchctl bootout  "gui/${console_uid}/com.apple.calaccessd" 2>/dev/null
-        # SIP blocks bootout
         sudo killall calaccessd 2>/dev/null && log_msg "Stopped calaccessd."
     fi
 fi
 if [[ "$is_analytics_allowed" == false ]]; then
     log_msg "Disabling analyticsd to prevent analytics events from waking the system."
-    # "Share Mac Analytics" osanalyticshelper
     sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit -bool false
-    # "Share with App Developers" third-party crash report
     sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit -bool false
 fi
-## extra features
-if [[ "$is_lessbright_allowed" == false ]]; then
-    log_msg "Disabling dim screen on battery."
-    sudo pmset -b lessbright 0
-fi
+enforce_pmset
+log_msg "Applied pmset settings."
 while true; do
     sleep $TIME_RESOLUTION
     
@@ -244,10 +245,7 @@ while true; do
         if [[ "$STATE" == "sleeping" ]]; then
             log_msg "System woke up."
             STATE="awake"
-            sudo pmset -a hibernatemode 3
-            sudo pmset -a standbydelaylow 10800
-            sudo pmset -a standbydelayhigh 86400
-            # Restart CoreAudio daemon
+            enforce_pmset
             # coreaudiod fails to resync its ring buffer positions after
             # hibernate (mode 25) wake, causing a ~536M frame offset
             sudo killall coreaudiod 2>/dev/null && log_msg "Restarted coreaudiod."
