@@ -46,6 +46,17 @@ is_display_asleep() {
     # State 4 = on, anything less = dimmed/off/asleep
     ! ioreg -n IODisplayWrangler | grep -i IOPowerManagement | grep -q 'CurrentPowerState"=4'
 }
+# prevent sleep collision with full wake transition
+is_full_wake() {
+    # Graphics capability. Full wake is [CDNVA], darkwake is [CDN] (no V/A).
+    # Set when the kernel commits to the wake, before the panel lits up
+    pmset -g systemstate 2>/dev/null \
+        | awk -F: '/System Capabilities/{print $2}' | grep -q "Graphics" && return 0
+    pmset -g assertions 2>/dev/null \
+        | grep -qE '^[[:space:]]*UserIsActive[[:space:]]+1' && return 0
+    ! is_display_asleep && return 0
+    return 1
+}
 has_active_tty() {
     if [[ "$PERMISSION" == "tty" ]]; then
         # Only count SSH sessions, not local terminal windows
@@ -85,8 +96,8 @@ pause_media() {
 
 hibernate_now() {
     log_msg "Initiating hibernate..."
-    if ! is_display_asleep; then
-        log_msg "Display on, aborting hibernate."
+    if is_full_wake; then
+        log_msg "Full wake in progress, aborting hibernate."
         return 1
     fi
     pause_media
@@ -97,7 +108,7 @@ hibernate_now() {
     sudo pmset -b powernap 0
     sudo pmset -b womp 0
     sleep 5
-    if ! is_display_asleep; then
+    if is_full_wake; then
         log_msg "User woke during hibernate prep. Restoring defaults."
         sudo pmset -a hibernatemode 3
         sudo pmset -a standbydelaylow 10800
@@ -109,6 +120,10 @@ hibernate_now() {
 }
 sleep_now() {
     log_msg "Initiating sleep..."
+    if is_full_wake; then
+        log_msg "Full wake in progress, aborting sleep."
+        return 1
+    fi
     pause_media
     sudo pmset -a hibernatemode 3
     sudo pmset -b powernap 0
@@ -169,8 +184,8 @@ while true; do
     if [[ -z "$BATT" ]]; then continue; fi
 
     # Check if system just woke up or is in darkwake
-    if is_display_asleep; then
-        # Display is off. Could be sleeping or darkwake. 
+    if ! is_full_wake; then
+        # Dark: sleeping or darkwake (no graphics, no user, panel off).
         
         # Absolute low battery check happens only when display is off
         if [[ "$AC_POWER" -eq 0 && "$BATT" -le "$LOW_BATTERY_THRESHOLD" ]]; then
@@ -190,7 +205,7 @@ while true; do
             if [[ "$BATT_DROP" -ge "$THRESHOLD_PERCENT" ]]; then
                 log_msg "Battery dropped by $BATT_DROP%. Hibernating."
                 sleep 30 # wait for VM settle
-               	if is_display_asleep; then
+               	if ! is_full_wake; then
 	                if [[ "$THRESHOLD_RESPONSE" == "hibernate" ]]; then
 	                    hibernate_now
 	                else
@@ -204,7 +219,7 @@ while true; do
                 # handle darkwake here
                 log_msg "Darkwake detected. Waiting 30s to settle before sleep."
                 sleep 30
-                if is_display_asleep; then
+                if ! is_full_wake; then
                     pmset sleepnow
                 else
                     log_msg "Aborted re-sleep, display is on (user woke system)."
