@@ -96,8 +96,9 @@ pause_media() {
 
 enforce_pmset() {
     sudo pmset -a hibernatemode 3
-    sudo pmset -a standbydelaylow 10800
-    sudo pmset -a standbydelayhigh 86400
+    # short standby on all profiles since delay is not reevaluated on power source change
+    sudo pmset -a standbydelaylow 300
+    sudo pmset -a standbydelayhigh 300
     sudo pmset -b powernap 0
     sudo pmset -b womp 0
     if [[ "$is_tcp_keepalive" == false ]]; then
