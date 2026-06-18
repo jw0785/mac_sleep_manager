@@ -48,13 +48,13 @@ is_display_asleep() {
 }
 # prevent sleep collision with full wake transition
 is_full_wake() {
-    # Graphics capability. Full wake is [CDNVA], darkwake is [CDN] (no V/A).
-    # Set when the kernel commits to the wake, before the panel lits up
-    pmset -g systemstate 2>/dev/null \
-        | awk -F: '/System Capabilities/{print $2}' | grep -q "Graphics" && return 0
-    pmset -g assertions 2>/dev/null \
-        | grep -qE '^[[:space:]]*UserIsActive[[:space:]]+1' && return 0
     ! is_display_asleep && return 0
+    # lid-open transition: woke recently(30 sec) from lid open, display not on yet
+    local wake_sec
+    wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+    if [[ -n "$wake_sec" ]] && (( $(date +%s) - wake_sec < 30 )); then
+        ioreg -c IOPMrootDomain | grep -q '"Wake Reason" = "EC.LidOpen"' && return 0
+    fi
     return 1
 }
 has_active_tty() {
@@ -96,17 +96,22 @@ pause_media() {
 
 enforce_pmset() {
     sudo pmset -a hibernatemode 3
-    # short standby on all profiles since delay is not reevaluated on power source change
-    sudo pmset -a standbydelaylow 300
-    sudo pmset -a standbydelayhigh 300
-    sudo pmset -b powernap 0
-    sudo pmset -b womp 0
+    # macOS doesn't re-evaluate standby delay on source change, so we do it
+    if is_on_ac; then
+        sudo pmset -a standbydelaylow 10800
+        sudo pmset -a standbydelayhigh 86400
+    else
+        sudo pmset -a standbydelaylow 300
+        sudo pmset -a standbydelayhigh 300
+    fi
+    sudo pmset -a powernap 0
+    sudo pmset -a womp 0
     if [[ "$is_tcp_keepalive" == false ]]; then
-        sudo pmset -b tcpkeepalive 0
-        sudo pmset -b networkoversleep 0
+        sudo pmset -a tcpkeepalive 0
+        sudo pmset -a networkoversleep 0
     fi
     if [[ "$is_lessbright_allowed" == false ]]; then
-        sudo pmset -b lessbright 0
+        sudo pmset -a lessbright 0
     fi
 }
 hibernate_now() {
@@ -125,9 +130,7 @@ hibernate_now() {
     sleep 5
     if is_full_wake; then
         log_msg "User woke during hibernate prep. Restoring defaults."
-        sudo pmset -a hibernatemode 3
-        sudo pmset -a standbydelaylow 10800
-        sudo pmset -a standbydelayhigh 86400
+        enforce_pmset
         return 1
     fi
     sudo pmset sleepnow
@@ -140,9 +143,7 @@ sleep_now() {
         return 1
     fi
     pause_media
-    sudo pmset -a hibernatemode 3
-    sudo pmset -b powernap 0
-    sudo pmset -b womp 0
+    enforce_pmset
     sleep 5
     sudo pmset sleepnow
     STATE="sleeping"
@@ -174,11 +175,18 @@ if [[ "$is_analytics_allowed" == false ]]; then
 fi
 enforce_pmset
 log_msg "Applied pmset settings."
+PREV_AC_POWER=-1
 while true; do
     sleep $TIME_RESOLUTION
-    
+
     AC_POWER=0
     is_on_ac && AC_POWER=1
+
+    if [[ "$AC_POWER" -ne "$PREV_AC_POWER" && "$PREV_AC_POWER" -ne -1 ]]; then
+        log_msg "Power source changed (AC=$AC_POWER). Re-applying pmset."
+        enforce_pmset
+    fi
+    PREV_AC_POWER=$AC_POWER
     
     IDLE=$(get_idle_time)
     BATT=$(get_battery_level)
