@@ -38,17 +38,21 @@ get_battery_level() {
         echo ""
     fi
 }
-is_on_ac() {
+_is_on_ac() {
     pmset -g batt | grep -q "AC Power"
     return $?
 }
-is_display_asleep() {
+_is_display_asleep() {
     # State 4 = on, anything less = dimmed/off/asleep
     ! ioreg -n IODisplayWrangler | grep -i IOPowerManagement | grep -q 'CurrentPowerState"=4'
 }
 # prevent sleep collision with full wake transition
 is_full_wake() {
-    ! is_display_asleep && return 0
+    if ! _is_display_asleep; then
+        # address usb insertion phantom wake
+        ioreg -c IOPMrootDomain | grep -q '"AppleClamshellState" = Yes' && ! _is_on_ac && return 1
+        return 0
+    fi
     # lid-open transition: woke recently(30 sec) from lid open, display not on yet
     local wake_sec
     wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
@@ -97,7 +101,7 @@ pause_media() {
 enforce_pmset() {
     sudo pmset -a hibernatemode 3
     # macOS doesn't re-evaluate standby delay on source change, so we do it
-    if is_on_ac; then
+    if _is_on_ac; then
         sudo pmset -a standbydelaylow 10800
         sudo pmset -a standbydelayhigh 86400
     else
@@ -180,7 +184,7 @@ while true; do
     sleep $TIME_RESOLUTION
 
     AC_POWER=0
-    is_on_ac && AC_POWER=1
+    _is_on_ac && AC_POWER=1
 
     if [[ "$AC_POWER" -ne "$PREV_AC_POWER" && "$PREV_AC_POWER" -ne -1 ]]; then
         log_msg "Power source changed (AC=$AC_POWER). Re-applying pmset."
