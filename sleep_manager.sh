@@ -20,6 +20,7 @@ is_lessbright_allowed=false
 # Internal State Variables
 STATE="awake"
 BATTERY_AT_SLEEP=100
+LAST_HANDLED_WAKE=0
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -97,7 +98,27 @@ pause_media() {
         # killall -TERM mpv
     fi
 }
-
+disable_powernap() {
+    local src="/System/Library/FeatureFlags/Domain/powerd.plist"
+    local dst="/Library/FeatureFlags/Domain/powerd.plist"
+    if [[ ! -f "$src" ]]; then
+        log_msg "powerd feature flag plist not found, skipping."
+        return 1
+    fi
+    sudo mkdir -p /Library/FeatureFlags/Domain
+    sudo cp "$src" "$dst"
+    local keys
+    keys=$(/usr/libexec/PlistBuddy -c "Print" "$dst" 2>/dev/null \
+        | grep "= Dict" | sed 's/ *\(.*\) = Dict.*/\1/')
+    for key in $keys; do
+        local val
+        val=$(/usr/libexec/PlistBuddy -c "Print :${key}:Enabled" "$dst" 2>/dev/null)
+        if [[ "$val" == "true" ]]; then
+            sudo /usr/libexec/PlistBuddy -c "Set :${key}:Enabled false" "$dst"
+            log_msg "Disabled feature flag: $key"
+        fi
+    done
+}
 enforce_pmset() {
     sudo pmset -a hibernatemode 3
     # macOS doesn't re-evaluate standby delay on source change, so we do it
@@ -177,6 +198,7 @@ if [[ "$is_analytics_allowed" == false ]]; then
     sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit -bool false
     sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit -bool false
 fi
+disable_powernap
 enforce_pmset
 log_msg "Applied pmset settings."
 PREV_AC_POWER=-1
@@ -255,7 +277,13 @@ while true; do
         continue
     else
         # Display is on, update state to awake
-        if [[ "$STATE" == "sleeping" ]]; then
+        wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+        is_new_wake=false
+        if [[ -n "$wake_sec" ]] && (( wake_sec > LAST_HANDLED_WAKE )); then
+            is_new_wake=true
+            LAST_HANDLED_WAKE=$wake_sec
+        fi
+        if [[ "$STATE" == "sleeping" ]] || [[ "$is_new_wake" == true ]]; then
             log_msg "System woke up."
             STATE="awake"
             enforce_pmset
