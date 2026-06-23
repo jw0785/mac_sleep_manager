@@ -170,8 +170,14 @@ sleep_now() {
     pause_media
     enforce_pmset
     sleep 5
+    local ts_before=$(date +%s)
     sudo pmset sleepnow
     STATE="sleeping"
+    sleep $TIME_RESOLUTION
+    local elapsed=$(( $(date +%s) - ts_before ))
+    if (( elapsed < TIME_RESOLUTION + 30 )); then
+        log_msg "WARNING: Sleep not honored (returned in ${elapsed}s)."
+    fi
 }
 log_msg "Starting Sleep Manager..."
 # Check if Intel Mac laptop to set GPU preference to reduce power usage
