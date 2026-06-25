@@ -8,7 +8,7 @@ IDLE_TIME_SEC=900            # idle_time
 TIME_RESOLUTION=60           # time_resolution
 THRESHOLD_PERCENT=15         # threshold (battery drop % during sleep to trigger hibernate)
 LOW_BATTERY_THRESHOLD=20     # low_battery_threshold
-# TODO: add time threshold on battery
+IDLE_DURATION_THRESHOLD=86400   # in seconds (trigger hibernate after sleep duration on BATTERY)
 THRESHOLD_RESPONSE="hibernate" # threshold_response (hibernate or sleep)
 PERMISSION="tty"             # permission {none, tty} - prevent sleep if active tty/ssh exists
 is_tcp_keepalive=false
@@ -21,6 +21,7 @@ is_lessbright_allowed=false
 STATE="awake"
 BATTERY_AT_SLEEP=100
 LAST_HANDLED_WAKE=0
+SLEEP_START_TIME=0
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -162,6 +163,9 @@ hibernate_now() {
     STATE="sleeping"
 }
 sleep_now() {
+    if [[ "$STATE" != "sleeping" ]]; then
+        SLEEP_START_TIME=$(date +%s)
+    fi
     log_msg "Initiating sleep..."
     if is_full_wake; then
         log_msg "Full wake in progress, aborting sleep."
@@ -185,7 +189,8 @@ MACHINE_MODEL=$(sysctl -n hw.model)
 if [[ "$MACHINE_MODEL" == MacBook* ]] || [[ "$MACHINE_MODEL" == MacBookPro* ]] || [[ "$MACHINE_MODEL" == MacBookAir* ]]; then
     if ! sysctl hw.optional.arm64 2>/dev/null | grep -q ": 1"; then
         log_msg "Intel Mac detected. Setting GPU preference to integrated."
-        sudo pmset -a gpuswitch 0
+        sudo pmset -b gpuswitch 0
+        sudo pmset -c gpuswitch 1
     fi
 fi
 # one-time init that only needs to run at daemon start
@@ -256,6 +261,9 @@ while true; do
                 else
                 	log_msg "Aborted re-sleep, display is on (user woke system)."
                	fi
+            elif [[ "$AC_POWER" -eq 0 ]] && (( $(date +%s) - SLEEP_START_TIME >= IDLE_DURATION_THRESHOLD )); then
+                log_msg "Asleep for $(( $(date +%s) - SLEEP_START_TIME ))s on battery, exceeds ${IDLE_DURATION_THRESHOLD}s threshold. Hibernating."
+                hibernate_now
             else
                 # Not enough drain yet, but re-sleep in case of phantom wake like t2 macbook touchbar
                 # handle darkwake here
