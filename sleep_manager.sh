@@ -13,7 +13,8 @@ THRESHOLD_RESPONSE="hibernate" # threshold_response (hibernate or sleep)
 PERMISSION="tty"             # permission {none, tty} - prevent sleep if active tty/ssh exists
 is_tcp_keepalive=false
 # darkwake, sched related
-is_calaccessd_allowed=true          # necessary for calendar time to leave. unless you don't use icalendar.
+is_calaccessd_allowed=false          # necessary for calendar time to leave. unless you don't use icalendar.
+# TODO: disable for now, trigger rapid consecutive darkwake and cause states desync
 is_analytics_allowed=false
 ## extra
 is_lessbright_allowed=false
@@ -140,6 +141,16 @@ enforce_pmset() {
         sudo pmset -a lessbright 0
     fi
 }
+handle_wake() {
+    log_msg "System woke up."
+    local was_hibernating=false
+    [[ "$STATE" == "hibernating" ]] && was_hibernating=true
+    STATE="awake"
+    enforce_pmset
+    if [[ "$was_hibernating" == true ]]; then
+        sudo killall coreaudiod 2>/dev/null && log_msg "Restarted coreaudiod (post-hibernate)."
+    fi
+}
 hibernate_now() {
     log_msg "Initiating hibernate..."
     if is_full_wake; then
@@ -160,10 +171,10 @@ hibernate_now() {
         return 1
     fi
     sudo pmset sleepnow
-    STATE="sleeping"
+    STATE="hibernating"
 }
 sleep_now() {
-    if [[ "$STATE" != "sleeping" ]]; then
+    if [[ "$STATE" == "awake" ]]; then
         SLEEP_START_TIME=$(date +%s)
     fi
     log_msg "Initiating sleep..."
@@ -297,13 +308,8 @@ while true; do
             is_new_wake=true
             LAST_HANDLED_WAKE=$wake_sec
         fi
-        if [[ "$STATE" == "sleeping" ]] || [[ "$is_new_wake" == true ]]; then
-            log_msg "System woke up."
-            STATE="awake"
-            enforce_pmset
-            # coreaudiod fails to resync its ring buffer positions after
-            # hibernate (mode 25) wake, causing a ~536M frame offset
-            sudo killall coreaudiod 2>/dev/null && log_msg "Restarted coreaudiod."
+        if [[ "$STATE" != "awake" ]] || [[ "$is_new_wake" == true ]]; then
+            handle_wake
         fi
     fi
     # Block sleeping if there is an active TTY session and permissions require it
