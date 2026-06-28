@@ -21,6 +21,8 @@ is_handoff_allowed=false
 is_lessbright_allowed=false
 # Internal State Variables
 STATE="awake"
+wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+is_new_wake=false
 BATTERY_AT_SLEEP=100
 LAST_HANDLED_WAKE=0
 SLEEP_START_TIME=0
@@ -92,13 +94,17 @@ pause_media() {
               -e 'end tell' \
               -e 'end ignoring' >/dev/null 2>&1
 
-    # pause known process ignoring that.
     if pgrep -x "mpv" > /dev/null; then
-        log_msg "mpv detected. Attempting to pause or kill."
-        # Try to send media pause key
-        osascript -e 'tell application "System Events" to key code 100'
-        # TODO: test if sigterm is necessary
-        # killall -TERM mpv
+        MPV_SOCKET="/tmp/mpvsocket"
+        # Add `input-ipc-server=/tmp/mpvsocket` to mpv.conf
+        if [[ -S "$MPV_SOCKET" ]]; then
+            echo '{"command":["set_property","vid","no"]}' | nc -w 1 -U "$MPV_SOCKET" >/dev/null 2>&1
+            log_msg "mpv: detached video track to release GPU rendering."
+        else
+            # WARNING: this mostly doesn't work without GPU context release
+            log_msg "mpv detected but no IPC socket. Sending SIGSTOP."
+            killall -STOP mpv
+        fi
     fi
 }
 disable_powernap() {
@@ -149,6 +155,16 @@ handle_wake() {
     [[ "$STATE" == "hibernating" ]] && was_hibernating=true
     STATE="awake"
     enforce_pmset
+    if pgrep -x "mpv" > /dev/null; then
+        MPV_SOCKET="/tmp/mpvsocket"
+        if [[ -S "$MPV_SOCKET" ]]; then
+            echo '{"command":["set_property","vid","auto"]}' | nc -w 1 -U "$MPV_SOCKET" >/dev/null 2>&1
+            log_msg "mpv: reattached video track."
+        else
+            # WARNING: this mostly doesn't work without GPU context release
+            killall -CONT mpv 2>/dev/null && log_msg "Resumed mpv (SIGCONT)."
+        fi
+    fi
     if [[ "$was_hibernating" == true ]]; then
         sudo killall coreaudiod 2>/dev/null && log_msg "Restarted coreaudiod (post-hibernate)."
     fi
@@ -323,10 +339,8 @@ while true; do
            fi
         fi
         continue
-    else
+    elif is_full_wake; then
         # Display is on, update state to awake
-        wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
-        is_new_wake=false
         if [[ -n "$wake_sec" ]] && (( wake_sec > LAST_HANDLED_WAKE )); then
             is_new_wake=true
             LAST_HANDLED_WAKE=$wake_sec
