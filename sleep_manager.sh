@@ -13,9 +13,10 @@ THRESHOLD_RESPONSE="hibernate" # threshold_response (hibernate or sleep)
 PERMISSION="tty"             # permission {none, tty} - prevent sleep if active tty/ssh exists
 is_tcp_keepalive=false
 # darkwake, sched related
-is_calaccessd_allowed=false          # necessary for calendar time to leave. unless you don't use icalendar.
-# TODO: disable for now, trigger rapid consecutive darkwake and cause states desync
+is_calaccessd_allowed=false         # necessary for calendar time to leave. unless you don't use icalendar.
+                                    # TODO: disable for now, trigger rapid consecutive darkwake and cause states desync
 is_analytics_allowed=false
+is_handoff_allowed=false
 ## extra
 is_lessbright_allowed=false
 # Internal State Variables
@@ -123,6 +124,7 @@ disable_powernap() {
 }
 enforce_pmset() {
     sudo pmset -a hibernatemode 3
+    sudo pmset -a proximitywake 0
     # macOS doesn't re-evaluate standby delay on source change, so we do it
     if _is_on_ac; then
         sudo pmset -a standbydelaylow 10800
@@ -214,11 +216,32 @@ if [[ "$is_calaccessd_allowed" == false ]]; then
         launchctl disable "gui/${console_uid}/com.apple.calaccessd"
         sudo killall calaccessd 2>/dev/null && log_msg "Stopped calaccessd."
     fi
+    # purge orphaned wake alarms left in powerd's schedule
+    pmset -g sched 2>/dev/null | grep "calaccessd" | while read -r line; do
+        local dt
+        dt=$(echo "$line" | sed "s/.*wake at \(.*\) by.*/\1/")
+        sudo pmset schedule cancel wake "$dt" 2>/dev/null && log_msg "Cancelled orphaned calaccessd wake alarm."
+    done
 fi
 if [[ "$is_analytics_allowed" == false ]]; then
-    log_msg "Disabling analyticsd to prevent analytics events from waking the system."
-    sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit -bool false
-    sudo defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit -bool false
+    log_msg "Disabling osanalytics to prevent analytics wake scheduling."
+    sudo launchctl disable system/com.apple.osanalytics.osanalyticshelper
+    sudo killall osanalyticshelper 2>/dev/null && log_msg "Stopped osanalyticshelper."
+    console_uid=$(stat -f %u /dev/console)
+    if [[ "$console_uid" != "0" && -n "$console_uid" ]]; then
+        launchctl disable "gui/${console_uid}/com.apple.osanalytics.user.cachedelete"
+    fi
+    pmset -g sched 2>/dev/null | grep "osanalytics" | while read -r line; do
+        local dt
+        dt=$(echo "$line" | sed "s/.*wake at \(.*\) by.*/\1/")
+        sudo pmset schedule cancel wake "$dt" 2>/dev/null && log_msg "Cancelled orphaned osanalytics wake alarm."
+    done
+fi
+if [[ "$is_handoff_allowed" == false ]]; then
+    log_msg "Disabling Handoff to prevent handoff wake scheduling."
+    sudo defaults write /Library/Preferences/com.apple.coreservices.useractivityd.plist ActivityAdvertisingAllowed -bool false
+    sudo defaults write /Library/Preferences/com.apple.coreservices.useractivityd.plist ActivityReceivingAllowed -bool false
+    sudo killall useractivityd 2>/dev/null && log_msg "Stopped useractivityd."
 fi
 disable_powernap
 enforce_pmset
