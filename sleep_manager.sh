@@ -26,6 +26,17 @@ is_new_wake=false
 BATTERY_AT_SLEEP=100
 LAST_HANDLED_WAKE=0
 SLEEP_START_TIME=0
+CAFFEINATE_PID=""
+
+start_caffeinate() {
+    [[ -n "$CAFFEINATE_PID" ]] && kill "$CAFFEINATE_PID" 2>/dev/null
+    caffeinate -s -w $$ &
+    CAFFEINATE_PID=$!
+}
+stop_caffeinate() {
+    [[ -n "$CAFFEINATE_PID" ]] && kill "$CAFFEINATE_PID" 2>/dev/null
+    CAFFEINATE_PID=""
+}
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -49,8 +60,15 @@ _is_on_ac() {
     return $?
 }
 _is_display_asleep() {
-    # State 4 = on, anything less = dimmed/off/asleep
-    ! ioreg -n IODisplayWrangler | grep -i IOPowerManagement | grep -q 'CurrentPowerState"=4'
+    if ! ioreg -n IODisplayWrangler | grep -i IOPowerManagement | grep -q 'CurrentPowerState"=4'; then
+        return 0
+    fi
+    # apparently mpv can hold wrangler at 4 with lid closed — fall back to clamshell
+    if pgrep -x "mpv" > /dev/null; then
+        ioreg -c IOPMrootDomain | grep -q '"AppleClamshellState" = Yes'
+        return $?
+    fi
+    return 1
 }
 # prevent sleep collision with full wake transition
 is_full_wake() {
@@ -95,14 +113,34 @@ pause_media() {
               -e 'end ignoring' >/dev/null 2>&1
 
     if pgrep -x "mpv" > /dev/null; then
-        MPV_SOCKET="/tmp/mpvsocket"
-        # Add `input-ipc-server=/tmp/mpvsocket` to mpv.conf
-        if [[ -S "$MPV_SOCKET" ]]; then
-            echo '{"command":["set_property","vid","no"]}' | nc -w 1 -U "$MPV_SOCKET" >/dev/null 2>&1
-            log_msg "mpv: detached video track to release GPU rendering."
+        rm -f /tmp/mpv_resume.*.playlist /tmp/mpv_resume.*.pos /tmp/mpv_resume.*.time
+        local idx=0 saved_socks=()
+        for sock in /tmp/mpvsocket.*; do
+            [[ -S "$sock" ]] || continue
+            local raw_pl raw_pos raw_time
+            raw_pl=$(echo '{"command":["get_property","playlist"]}' | nc -w 1 -U "$sock" 2>/dev/null)
+            raw_pos=$(echo '{"command":["get_property","playlist-pos"]}' | nc -w 1 -U "$sock" 2>/dev/null)
+            raw_time=$(echo '{"command":["get_property","time-pos"]}' | nc -w 1 -U "$sock" 2>/dev/null)
+            echo "$raw_pl" | grep -o '"filename":"[^"]*"' | sed 's/"filename":"//;s/"$//' > "/tmp/mpv_resume.${idx}.playlist"
+            echo "$raw_pos" | sed 's/.*"data":\([0-9]*\).*/\1/' > "/tmp/mpv_resume.${idx}.pos"
+            echo "$raw_time" | sed 's/.*"data":\([0-9.]*\).*/\1/' > "/tmp/mpv_resume.${idx}.time"
+            if [[ -s "/tmp/mpv_resume.${idx}.playlist" ]]; then
+                log_msg "mpv: saved state from $sock (idx=$idx)."
+                saved_socks+=("$sock")
+                (( idx++ ))
+            else
+                rm -f "/tmp/mpv_resume.${idx}.playlist" "/tmp/mpv_resume.${idx}.pos" "/tmp/mpv_resume.${idx}.time"
+            fi
+        done
+        if (( ${#saved_socks[@]} > 0 )); then
+            for sock in "${saved_socks[@]}"; do
+                echo '{"command":["quit"]}' | nc -w 1 -U "$sock" >/dev/null 2>&1
+            done
+            log_msg "mpv: quit ${#saved_socks[@]} instance(s) via IPC."
+            sleep 1
+            pgrep -x "mpv" > /dev/null && killall mpv 2>/dev/null && log_msg "mpv: killed remaining instances."
         else
-            # WARNING: this mostly doesn't work without GPU context release
-            log_msg "mpv detected but no IPC socket. Sending SIGSTOP."
+            log_msg "mpv: no IPC sockets found. Sending SIGSTOP."
             killall -STOP mpv
         fi
     fi
@@ -133,11 +171,12 @@ enforce_pmset() {
     sudo pmset -a proximitywake 0
     # macOS doesn't re-evaluate standby delay on source change, so we do it
     if _is_on_ac; then
-        sudo pmset -a standbydelaylow 10800
-        sudo pmset -a standbydelayhigh 86400
+        sudo pmset -a standby 0
     else
-        sudo pmset -a standbydelaylow 300
-        sudo pmset -a standbydelayhigh 300
+        sudo pmset -a standby 1
+        sudo pmset -a standbythreshold 20 # default 50%
+        sudo pmset -a standbydelaylow 300 # default 10800 min
+        sudo pmset -a standbydelayhigh 86400 # default 86400 min
     fi
     sudo pmset -a powernap 0
     sudo pmset -a womp 0
@@ -154,16 +193,29 @@ handle_wake() {
     local was_hibernating=false
     [[ "$STATE" == "hibernating" ]] && was_hibernating=true
     STATE="awake"
+    start_caffeinate
     enforce_pmset
     if pgrep -x "mpv" > /dev/null; then
-        MPV_SOCKET="/tmp/mpvsocket"
-        if [[ -S "$MPV_SOCKET" ]]; then
-            echo '{"command":["set_property","vid","auto"]}' | nc -w 1 -U "$MPV_SOCKET" >/dev/null 2>&1
-            log_msg "mpv: reattached video track."
-        else
-            # WARNING: this mostly doesn't work without GPU context release
-            killall -CONT mpv 2>/dev/null && log_msg "Resumed mpv (SIGCONT)."
-        fi
+        killall -CONT mpv 2>/dev/null && log_msg "mpv: sent SIGCONT to surviving instances."
+        rm -f /tmp/mpv_resume.*.playlist /tmp/mpv_resume.*.pos /tmp/mpv_resume.*.time
+        log_msg "mpv: cleaned stale state files."
+    else
+        local console_uid console_user
+        console_uid=$(stat -f %u /dev/console)
+        console_user=$(stat -f %Su /dev/console)
+        for pl_file in /tmp/mpv_resume.*.playlist; do
+            [[ -f "$pl_file" ]] || continue
+            local idx="${pl_file#/tmp/mpv_resume.}" && idx="${idx%.playlist}"
+            [[ -f "/tmp/mpv_resume.${idx}.pos" ]] || continue
+            local pos time_pos start_args=""
+            pos=$(cat "/tmp/mpv_resume.${idx}.pos" 2>/dev/null)
+            time_pos=$(cat "/tmp/mpv_resume.${idx}.time" 2>/dev/null)
+            [[ -n "$pos" ]] && start_args="--playlist-start=$pos"
+            [[ -n "$time_pos" && "$time_pos" != "0" && "$time_pos" != "0.000000" ]] && start_args="$start_args --start=$time_pos"
+            launchctl asuser "$console_uid" sudo -u "$console_user" /usr/local/bin/mpv --playlist="$pl_file" $start_args >/dev/null 2>&1 &
+            log_msg "mpv: relaunched instance $idx (pos=$pos, time=$time_pos)."
+            rm -f "/tmp/mpv_resume.${idx}.pos" "/tmp/mpv_resume.${idx}.time"
+        done
     fi
     if [[ "$was_hibernating" == true ]]; then
         sudo killall coreaudiod 2>/dev/null && log_msg "Restarted coreaudiod (post-hibernate)."
@@ -176,6 +228,7 @@ hibernate_now() {
         return 1
     fi
     pause_media
+    stop_caffeinate
     sudo pmset -a standbydelaylow 0
     sudo pmset -b networkoversleep 0
     sudo pmset -a standbydelayhigh 0
@@ -202,7 +255,7 @@ sleep_now() {
     fi
     pause_media
     enforce_pmset
-    sleep 5
+    stop_caffeinate
     local ts_before=$(date +%s)
     sudo pmset sleepnow
     STATE="sleeping"
@@ -213,6 +266,7 @@ sleep_now() {
     fi
 }
 log_msg "Starting Sleep Manager..."
+start_caffeinate
 # Check if Intel Mac laptop to set GPU preference to reduce power usage
 MACHINE_MODEL=$(sysctl -n hw.model)
 if [[ "$MACHINE_MODEL" == MacBook* ]] || [[ "$MACHINE_MODEL" == MacBookPro* ]] || [[ "$MACHINE_MODEL" == MacBookAir* ]]; then
@@ -341,6 +395,8 @@ while true; do
         continue
     elif is_full_wake; then
         # Display is on, update state to awake
+        wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+        is_new_wake=false
         if [[ -n "$wake_sec" ]] && (( wake_sec > LAST_HANDLED_WAKE )); then
             is_new_wake=true
             LAST_HANDLED_WAKE=$wake_sec

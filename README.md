@@ -16,8 +16,8 @@ before upgrade
 
 ## extra
 
-for mpv ipc handling, add the following to your `mpv.conf` to open a socket
+for mpv ipc handling, make below symlink
 
 ```
-input-ipc-server=/tmp/mpvsocket
+ln -s [full/path/to]/mpv_auto_socket.lua ~/.config/mpv/scripts/mpv_auto_socket.lua
 ```
