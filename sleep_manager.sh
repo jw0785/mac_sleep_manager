@@ -72,6 +72,16 @@ _is_display_asleep() {
 }
 # prevent sleep collision with full wake transition
 is_full_wake() {
+    # T2 phantom USBC wake: EC routes USB-C bus noise through ACPI lid sensor for reasons,
+    # powering on display even though lid is physically closed.
+    # On battery, USBC can never be a real user wake (charger would switch to AC).
+    if ! _is_on_ac; then
+        local recent_wake
+        recent_wake=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+        if [[ -n "$recent_wake" ]] && (( $(date +%s) - recent_wake < 120 )); then
+            ioreg -c IOPMrootDomain | grep -q '"Wake Reason" = "EC.USBC"' && return 1
+        fi
+    fi
     if ! _is_display_asleep; then
         # address usb insertion phantom wake
         ioreg -c IOPMrootDomain | grep -q '"AppleClamshellState" = Yes' && ! _is_on_ac && return 1
@@ -114,34 +124,40 @@ pause_media() {
 
     if pgrep -x "mpv" > /dev/null; then
         rm -f /tmp/mpv_resume.*.playlist /tmp/mpv_resume.*.pos /tmp/mpv_resume.*.time
-        local idx=0 saved_socks=()
-        for sock in /tmp/mpvsocket.*; do
-            [[ -S "$sock" ]] || continue
-            local raw_pl raw_pos raw_time
-            raw_pl=$(echo '{"command":["get_property","playlist"]}' | nc -w 1 -U "$sock" 2>/dev/null)
-            raw_pos=$(echo '{"command":["get_property","playlist-pos"]}' | nc -w 1 -U "$sock" 2>/dev/null)
-            raw_time=$(echo '{"command":["get_property","time-pos"]}' | nc -w 1 -U "$sock" 2>/dev/null)
-            echo "$raw_pl" | grep -o '"filename":"[^"]*"' | sed 's/"filename":"//;s/"$//' > "/tmp/mpv_resume.${idx}.playlist"
-            echo "$raw_pos" | sed 's/.*"data":\([0-9]*\).*/\1/' > "/tmp/mpv_resume.${idx}.pos"
-            echo "$raw_time" | sed 's/.*"data":\([0-9.]*\).*/\1/' > "/tmp/mpv_resume.${idx}.time"
-            if [[ -s "/tmp/mpv_resume.${idx}.playlist" ]]; then
-                log_msg "mpv: saved state from $sock (idx=$idx)."
-                saved_socks+=("$sock")
-                (( idx++ ))
-            else
-                rm -f "/tmp/mpv_resume.${idx}.playlist" "/tmp/mpv_resume.${idx}.pos" "/tmp/mpv_resume.${idx}.time"
-            fi
-        done
-        if (( ${#saved_socks[@]} > 0 )); then
-            for sock in "${saved_socks[@]}"; do
-                echo '{"command":["quit"]}' | nc -w 1 -U "$sock" >/dev/null 2>&1
+        (
+            idx=0
+            for sock in /tmp/mpvsocket.*; do
+                [[ -S "$sock" ]] || continue
+                raw_pl=$(echo '{"command":["get_property","playlist"]}' | nc -w 1 -U "$sock" 2>/dev/null)
+                raw_pos=$(echo '{"command":["get_property","playlist-pos"]}' | nc -w 1 -U "$sock" 2>/dev/null)
+                raw_time=$(echo '{"command":["get_property","time-pos"]}' | nc -w 1 -U "$sock" 2>/dev/null)
+                echo "$raw_pl" | grep -o '"filename":"[^"]*"' | sed 's/"filename":"//;s/"$//' > "/tmp/mpv_resume.${idx}.playlist"
+                echo "$raw_pos" | sed 's/.*"data":\([0-9]*\).*/\1/' > "/tmp/mpv_resume.${idx}.pos"
+                echo "$raw_time" | sed 's/.*"data":\([0-9.]*\).*/\1/' > "/tmp/mpv_resume.${idx}.time"
+                if [[ -s "/tmp/mpv_resume.${idx}.playlist" ]]; then
+                    log_msg "mpv: saved state from $sock (idx=$idx)."
+                    echo '{"command":["quit"]}' | nc -w 1 -U "$sock" >/dev/null 2>&1
+                    (( idx++ ))
+                else
+                    rm -f "/tmp/mpv_resume.${idx}.playlist" "/tmp/mpv_resume.${idx}.pos" "/tmp/mpv_resume.${idx}.time"
+                fi
             done
-            log_msg "mpv: quit ${#saved_socks[@]} instance(s) via IPC."
-            sleep 1
-            pgrep -x "mpv" > /dev/null && killall mpv 2>/dev/null && log_msg "mpv: killed remaining instances."
+        ) &
+        local save_pid=$!
+        ( sleep 10; kill "$save_pid" 2>/dev/null ) &
+        local wd_pid=$!
+        wait "$save_pid" 2>/dev/null
+        kill "$wd_pid" 2>/dev/null; wait "$wd_pid" 2>/dev/null
+        if ls /tmp/mpv_resume.*.playlist >/dev/null 2>&1; then
+            if pgrep -x "mpv" > /dev/null; then
+                killall mpv 2>/dev/null
+                log_msg "mpv: sent SIGTERM."
+                sleep 1
+                pgrep -x "mpv" > /dev/null && killall -9 mpv 2>/dev/null && log_msg "mpv: force-killed (SIGKILL)."
+            fi
         else
             log_msg "mpv: no IPC sockets found. Sending SIGSTOP."
-            killall -STOP mpv
+            killall -STOP mpv 2>/dev/null
         fi
     fi
 }
@@ -166,17 +182,64 @@ disable_powernap() {
         fi
     done
 }
+save_smb_mounts() {
+    rm -f /tmp/smb_resume.*
+    local idx=0
+    while read -r src; do
+        echo "$src" > "/tmp/smb_resume.${idx}"
+        (( idx++ ))
+    done < <(timeout 5 mount -t smbfs 2>/dev/null | awk '{print $1}')
+    (( idx > 0 )) && log_msg "SMB: saved $idx active mount(s)."
+}
+restore_smb_mounts() {
+    local has_state=false
+    for f in /tmp/smb_resume.*; do [[ -f "$f" ]] && has_state=true && break; done
+    [[ "$has_state" == false ]] && return
+    local console_uid console_user
+    console_uid=$(stat -f %u /dev/console)
+    console_user=$(stat -f %Su /dev/console)
+    if [[ "$console_uid" == "0" || -z "$console_uid" ]]; then
+        log_msg "SMB: no GUI user, skipping restore."
+        rm -f /tmp/smb_resume.*
+        return
+    fi
+    for f in /tmp/smb_resume.*; do
+        [[ -f "$f" ]] || continue
+        local src
+        src=$(cat "$f" 2>/dev/null)
+        [[ -z "$src" ]] && continue
+        if timeout 10 mount -t smbfs 2>/dev/null | grep -qF "$src"; then
+            log_msg "SMB: $src still mounted, skipping."
+            continue
+        fi
+        local smb_url="smb://${src#//}"
+        launchctl asuser "$console_uid" sudo -u "$console_user" \
+            open "$smb_url" 2>/dev/null && \
+            log_msg "SMB: reconnecting $smb_url" || \
+            log_msg "SMB: failed to open $smb_url"
+    done
+    rm -f /tmp/smb_resume.*
+}
 enforce_pmset() {
     sudo pmset -a hibernatemode 3
     sudo pmset -a proximitywake 0
-    # macOS doesn't re-evaluate standby delay on source change, so we do it
+    # macOS doesn't re-evaluate standby/gpuswitch on source change, so we have to enforce it manually
     if _is_on_ac; then
         sudo pmset -a standby 0
     else
         sudo pmset -a standby 1
-        sudo pmset -a standbythreshold 20 # default 50%
+        sudo pmset -a highstandbythreshold 20 # default 50%
         sudo pmset -a standbydelaylow 300 # default 10800 min
         sudo pmset -a standbydelayhigh 86400 # default 86400 min
+    fi
+    local machine_model
+    machine_model=$(sysctl -n hw.model)
+    if [[ "$machine_model" == MacBook* ]] && ! sysctl hw.optional.arm64 2>/dev/null | grep -q ": 1"; then
+        if _is_on_ac; then
+            sudo pmset -a gpuswitch 1
+        else
+            sudo pmset -a gpuswitch 0
+        fi
     fi
     sudo pmset -a powernap 0
     sudo pmset -a womp 0
@@ -195,6 +258,7 @@ handle_wake() {
     STATE="awake"
     start_caffeinate
     enforce_pmset
+    restore_smb_mounts
     if pgrep -x "mpv" > /dev/null; then
         killall -CONT mpv 2>/dev/null && log_msg "mpv: sent SIGCONT to surviving instances."
         rm -f /tmp/mpv_resume.*.playlist /tmp/mpv_resume.*.pos /tmp/mpv_resume.*.time
@@ -227,6 +291,7 @@ hibernate_now() {
         log_msg "Full wake in progress, aborting hibernate."
         return 1
     fi
+    save_smb_mounts
     pause_media
     stop_caffeinate
     sudo pmset -a standbydelaylow 0
@@ -253,6 +318,7 @@ sleep_now() {
         log_msg "Full wake in progress, aborting sleep."
         return 1
     fi
+    save_smb_mounts
     pause_media
     enforce_pmset
     stop_caffeinate
@@ -267,15 +333,6 @@ sleep_now() {
 }
 log_msg "Starting Sleep Manager..."
 start_caffeinate
-# Check if Intel Mac laptop to set GPU preference to reduce power usage
-MACHINE_MODEL=$(sysctl -n hw.model)
-if [[ "$MACHINE_MODEL" == MacBook* ]] || [[ "$MACHINE_MODEL" == MacBookPro* ]] || [[ "$MACHINE_MODEL" == MacBookAir* ]]; then
-    if ! sysctl hw.optional.arm64 2>/dev/null | grep -q ": 1"; then
-        log_msg "Intel Mac detected. Setting GPU preference to integrated."
-        sudo pmset -b gpuswitch 0
-        sudo pmset -c gpuswitch 1
-    fi
-fi
 # one-time init that only needs to run at daemon start
 if [[ "$is_calaccessd_allowed" == false ]]; then
     log_msg "Disabling calaccessd to prevent calendar events from scheduling darkwake"
@@ -307,6 +364,15 @@ if [[ "$is_analytics_allowed" == false ]]; then
         sudo pmset schedule cancel wake "$dt" 2>/dev/null && log_msg "Cancelled orphaned osanalytics wake alarm."
     done
 fi
+# use Al Dente, don't let OBC schedule and drain battery during sleep
+log_msg "Disabling Optimized Battery Charging maintenance wakes."
+sudo defaults write com.apple.smartcharging isEnabled -bool false 2>/dev/null
+sudo killall PowerUIAgent 2>/dev/null && log_msg "Stopped PowerUIAgent."
+pmset -g sched 2>/dev/null | grep "com.apple.obc" | while read -r line; do
+    local dt
+    dt=$(echo "$line" | sed "s/.*wake at \(.*\) by.*/\1/")
+    sudo pmset schedule cancel wake "$dt" 2>/dev/null && log_msg "Cancelled orphaned OBC wake alarm."
+done
 if [[ "$is_handoff_allowed" == false ]]; then
     log_msg "Disabling Handoff to prevent handoff wake scheduling."
     sudo defaults write /Library/Preferences/com.apple.coreservices.useractivityd.plist ActivityAdvertisingAllowed -bool false
