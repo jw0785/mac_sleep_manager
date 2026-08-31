@@ -6,6 +6,7 @@
 # Configuration
 IDLE_TIME_SEC=900            # idle_time
 TIME_RESOLUTION=60           # time_resolution
+TIME_RESOLUTION_SLEEP=5      # time_resolution during sleep
 THRESHOLD_PERCENT=15         # threshold (battery drop % during sleep to trigger hibernate)
 LOW_BATTERY_THRESHOLD=20     # low_battery_threshold
 IDLE_DURATION_THRESHOLD=86400   # in seconds (trigger hibernate after sleep duration on BATTERY)
@@ -19,41 +20,91 @@ is_analytics_allowed=false
 is_handoff_allowed=false
 ## extra
 is_lessbright_allowed=false
-# Internal State Variables
-STATE="awake"
-wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
-is_new_wake=false
-BATTERY_AT_SLEEP=100
-LAST_HANDLED_WAKE=0
-SLEEP_START_TIME=0
-CAFFEINATE_PID=""
+# Internal _State Variables
+_STATE="awake"
+_wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+_is_new_wake=false
+_BATTERY_AT_SLEEP=100
+_LAST_HANDLED_WAKE=0
+_SLEEP_START_TIME=0
+_CAFFEINATE_PID=""
+_IS_GAUGE_DESYNC=false
+_PREV_BATT=""
+_BATT_CURRENT_MA=0
+_BATT_DATA_AGE=0
+_SLEEP_CURRENT_LIMIT=1500
+_BG_ASSERT_BIN="/tmp/.sleep_mgr_assert"
+_HAS_T2=$(system_profiler SPiBridgeDataType 2>/dev/null | grep -q "T2" && echo true || echo false)
 
 start_caffeinate() {
-    [[ -n "$CAFFEINATE_PID" ]] && kill "$CAFFEINATE_PID" 2>/dev/null
+    [[ -n "$_CAFFEINATE_PID" ]] && kill "$_CAFFEINATE_PID" 2>/dev/null
     caffeinate -s -w $$ &
-    CAFFEINATE_PID=$!
+    _CAFFEINATE_PID=$!
 }
 stop_caffeinate() {
-    [[ -n "$CAFFEINATE_PID" ]] && kill "$CAFFEINATE_PID" 2>/dev/null
-    CAFFEINATE_PID=""
+    [[ -n "$_CAFFEINATE_PID" ]] && kill "$_CAFFEINATE_PID" 2>/dev/null
+    _CAFFEINATE_PID=""
 }
 
+LOG_FILE="/tmp/sleep_manager.log"
 log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 get_idle_time() {
     echo $(( $(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF; exit}') / 1000000000 ))
 }
-# use ioreg to avoid stale data
 get_battery_level() {
-    # Try raw SMC read first
-    local cap=$(ioreg -r -n AppleSmartBattery | awk '/CurrentCapacity/{print $NF; exit}')
-    local max=$(ioreg -r -n AppleSmartBattery | awk '/MaxCapacity/{print $NF; exit}')
-    if [[ -n "$cap" && -n "$max" && "$max" -gt 0 ]]; then
-        echo $(( cap * 100 / max ))
-    else
-        echo ""
+    # # TODO: FIX STALE VOLTAGE DURING DARKWAKE
+    # _lerp_vsoc() {
+    #     local mv=$(( $1 + 50 )) i
+    #     local -a mV=(3300 3400 3600 3750 3850 3950 4100 4200)
+    #     local -a soc=(0    3    10   30   50   70   90   100)
+    #     if (( mv <= mV[0] )); then echo 0; return; fi
+    #     if (( mv >= mV[${#mV[@]}-1] )); then echo 100; return; fi
+    #     for (( i=1; i<${#mV[@]}; i++ )); do
+    #         if (( mv <= mV[i] )); then
+    #             echo $(( soc[i-1] + (mv - mV[i-1]) * (soc[i] - soc[i-1]) / (mV[i] - mV[i-1]) ))
+    #             return
+    #         fi
+    #     done
+    # }
+    local raw
+    raw=$(ioreg -r -n AppleSmartBattery)
+    local pct
+    pct=$(pmset -g batt | grep -oE '[0-9]+%' | head -1 | tr -d '%')
+    if [[ -z "$pct" ]]; then
+        BATT=""
+        return
     fi
+    local ext_power amp
+    ext_power=$(echo "$raw" | awk '/ExternalConnected/{print $NF; exit}')
+    amp=$(echo "$raw" | awk '/"InstantAmperage"/{print $NF; exit}')
+    [[ -n "$amp" ]] && _BATT_CURRENT_MA=$(( -amp ))
+    if [[ "$ext_power" == "Yes" ]]; then
+        BATT=$pct
+        _PREV_BATT=""
+        return
+    fi
+    local update_time now
+    update_time=$(echo "$raw" | awk '/^ *"UpdateTime"/{print $NF; exit}')
+    now=$(date +%s)
+    _BATT_DATA_AGE=$(( now - ${update_time:-0} ))
+    if [[ "$_IS_GAUGE_DESYNC" == true ]]; then
+        BATT=$pct
+        return
+    fi
+    if [[ "${1:-}" != "validate" ]]; then
+        BATT=$pct
+        return
+    fi
+    if [[ -n "$_PREV_BATT" ]] && (( pct >= _PREV_BATT + 2 )); then
+        log_msg "Gauge desync: ${pct}% > prev ${_PREV_BATT}% on DC (impossible). Locking to hibernate."
+        _IS_GAUGE_DESYNC=true
+        BATT=$pct
+        return
+    fi
+    _PREV_BATT=$pct
+    BATT=$pct
 }
 _is_on_ac() {
     pmset -g batt | grep -q "AC Power"
@@ -88,9 +139,9 @@ is_full_wake() {
         return 0
     fi
     # lid-open transition: woke recently(30 sec) from lid open, display not on yet
-    local wake_sec
-    wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
-    if [[ -n "$wake_sec" ]] && (( $(date +%s) - wake_sec < 30 )); then
+    local _wake_sec
+    _wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+    if [[ -n "$_wake_sec" ]] && (( $(date +%s) - _wake_sec < 30 )); then
         ioreg -c IOPMrootDomain | grep -q '"Wake Reason" = "EC.LidOpen"' && return 0
     fi
     return 1
@@ -254,8 +305,13 @@ enforce_pmset() {
 handle_wake() {
     log_msg "System woke up."
     local was_hibernating=false
-    [[ "$STATE" == "hibernating" ]] && was_hibernating=true
-    STATE="awake"
+    [[ "$_STATE" == "hibernating" ]] && was_hibernating=true
+    _STATE="awake"
+    if [[ "$_IS_GAUGE_DESYNC" == true ]]; then
+        log_msg "User wake: clearing gauge desync flag."
+        _IS_GAUGE_DESYNC=false
+        _PREV_BATT=""
+    fi
     start_caffeinate
     enforce_pmset
     restore_smb_mounts
@@ -307,11 +363,16 @@ hibernate_now() {
         return 1
     fi
     sudo pmset sleepnow
-    STATE="hibernating"
+    _STATE="hibernating"
 }
 sleep_now() {
-    if [[ "$STATE" == "awake" ]]; then
-        SLEEP_START_TIME=$(date +%s)
+    if [[ "$_STATE" == "awake" ]]; then
+        _SLEEP_START_TIME=$(date +%s)
+    fi
+    if [[ "$_IS_GAUGE_DESYNC" == true ]] && ! _is_on_ac; then
+        log_msg "Gauge desync active. Routing to hibernate instead of sleep."
+        hibernate_now
+        return $?
     fi
     log_msg "Initiating sleep..."
     if is_full_wake; then
@@ -324,7 +385,7 @@ sleep_now() {
     stop_caffeinate
     local ts_before=$(date +%s)
     sudo pmset sleepnow
-    STATE="sleeping"
+    _STATE="sleeping"
     sleep $TIME_RESOLUTION
     local elapsed=$(( $(date +%s) - ts_before ))
     if (( elapsed < TIME_RESOLUTION + 30 )); then
@@ -333,6 +394,31 @@ sleep_now() {
 }
 log_msg "Starting Sleep Manager..."
 start_caffeinate
+disable_powernap
+enforce_pmset
+log_msg "Applied pmset settings."
+rm -f "$_BG_ASSERT_BIN"
+if [[ "$_HAS_T2" == true ]] && ! [[ -x "$_BG_ASSERT_BIN" ]]; then
+    cc -framework IOKit -framework CoreFoundation -O2 -o "$_BG_ASSERT_BIN" -x c - <<'ASSERT_SRC'
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+static IOPMAssertionID aid;
+void cleanup(int s) { if (aid) IOPMAssertionRelease(aid); _exit(0); }
+int main(int argc, char **argv) {
+    signal(SIGTERM, cleanup);
+    signal(SIGINT, cleanup);
+    if (IOPMAssertionCreateWithName(CFSTR("BackgroundTask"),
+            kIOPMAssertionLevelOn, CFSTR("sleep_manager"), &aid))
+        return 1;
+    sleep(argc > 1 ? atoi(argv[1]) : 65);
+    IOPMAssertionRelease(aid);
+}
+ASSERT_SRC
+    [[ -x "$_BG_ASSERT_BIN" ]] && log_msg "Compiled BackgroundTask helper." \
+        || log_msg "WARNING: failed to compile BackgroundTask helper."
+fi
 # one-time init that only needs to run at daemon start
 if [[ "$is_calaccessd_allowed" == false ]]; then
     log_msg "Disabling calaccessd to prevent calendar events from scheduling darkwake"
@@ -379,12 +465,13 @@ if [[ "$is_handoff_allowed" == false ]]; then
     sudo defaults write /Library/Preferences/com.apple.coreservices.useractivityd.plist ActivityReceivingAllowed -bool false
     sudo killall useractivityd 2>/dev/null && log_msg "Stopped useractivityd."
 fi
-disable_powernap
-enforce_pmset
-log_msg "Applied pmset settings."
 PREV_AC_POWER=-1
 while true; do
-    sleep $TIME_RESOLUTION
+    if [[ "$_STATE" == "sleeping" || "$_STATE" == "hibernating" ]]; then
+        sleep $TIME_RESOLUTION_SLEEP
+    else
+        sleep $TIME_RESOLUTION
+    fi
 
     AC_POWER=0
     _is_on_ac && AC_POWER=1
@@ -392,22 +479,52 @@ while true; do
     if [[ "$AC_POWER" -ne "$PREV_AC_POWER" && "$PREV_AC_POWER" -ne -1 ]]; then
         log_msg "Power source changed (AC=$AC_POWER). Re-applying pmset."
         enforce_pmset
+        if [[ "$_IS_GAUGE_DESYNC" == true ]]; then
+            log_msg "Power source transition: clearing gauge desync flag."
+            _IS_GAUGE_DESYNC=false
+        fi
+        _PREV_BATT=""
     fi
     PREV_AC_POWER=$AC_POWER
     
-    IDLE=$(get_idle_time)
-    BATT=$(get_battery_level)
-    
-    if [[ -z "$BATT" ]]; then continue; fi
-
     # Check if system just woke up or is in darkwake
     if ! is_full_wake; then
         # Dark: sleeping or darkwake (no graphics, no user, panel off).
-        
+        get_battery_level validate
+        if [[ -z "$BATT" ]]; then continue; fi
+
+        # On battery with stale data: hold darkwake open until battery driver refreshes
+        if [[ "$AC_POWER" -eq 0 ]] && (( _BATT_DATA_AGE > 60 )); then
+            log_msg "Battery data stale (${_BATT_DATA_AGE}s old). Holding darkwake for fresh reading."
+            DW_ASSERT_PID=""
+            if [[ "$_HAS_T2" == true ]] && [[ -x "$_BG_ASSERT_BIN" ]]; then
+                "$_BG_ASSERT_BIN" 65 &
+            else
+                caffeinate -s -t 65 &
+            fi
+            DW_ASSERT_PID=$!
+            DW_GOT_FRESH=false
+            for (( dw_i=0; dw_i<12; dw_i++ )); do
+                sleep 5
+                if is_full_wake; then break; fi
+                get_battery_level validate
+                if (( _BATT_DATA_AGE <= 60 )); then
+                    DW_GOT_FRESH=true
+                    break
+                fi
+            done
+            kill "$DW_ASSERT_PID" 2>/dev/null; wait "$DW_ASSERT_PID" 2>/dev/null
+            if [[ "$DW_GOT_FRESH" == false ]] && ! is_full_wake; then
+                log_msg "No fresh battery data after 60s darkwake hold. Forcing hibernation."
+                hibernate_now
+                continue
+            fi
+        fi
+
         # Absolute low battery check happens only when display is off
         if [[ "$AC_POWER" -eq 0 && "$BATT" -le "$LOW_BATTERY_THRESHOLD" ]]; then
             log_msg "Low battery threshold met while display off ($BATT%). Response: $THRESHOLD_RESPONSE"
-            BATTERY_AT_SLEEP=$BATT
+            _BATTERY_AT_SLEEP=$BATT
             if [[ "$THRESHOLD_RESPONSE" == "hibernate" ]]; then
                 hibernate_now
             else
@@ -417,8 +534,10 @@ while true; do
         fi
 
         # Check against battery drain threshold for hibernation transition:
-        if [[ "$STATE" == "sleeping" ]]; then
-            BATT_DROP=$(( BATTERY_AT_SLEEP - BATT ))
+        if [[ "$_STATE" == "sleeping" ]]; then
+            sleep 3
+            get_battery_level
+            BATT_DROP=$(( _BATTERY_AT_SLEEP - BATT ))
             if [[ "$BATT_DROP" -ge "$THRESHOLD_PERCENT" ]]; then
                 log_msg "Battery dropped by $BATT_DROP%. Hibernating."
                 sleep 30 # wait for VM settle
@@ -431,54 +550,63 @@ while true; do
                 else
                 	log_msg "Aborted re-sleep, display is on (user woke system)."
                	fi
-            elif [[ "$AC_POWER" -eq 0 ]] && (( $(date +%s) - SLEEP_START_TIME >= IDLE_DURATION_THRESHOLD )); then
-                log_msg "Asleep for $(( $(date +%s) - SLEEP_START_TIME ))s on battery, exceeds ${IDLE_DURATION_THRESHOLD}s threshold. Hibernating."
+            elif [[ "$AC_POWER" -eq 0 ]] && (( $(date +%s) - _SLEEP_START_TIME >= IDLE_DURATION_THRESHOLD )); then
+                log_msg "Asleep for $(( $(date +%s) - _SLEEP_START_TIME ))s on battery, exceeds ${IDLE_DURATION_THRESHOLD}s threshold. Hibernating."
+                hibernate_now
+            elif [[ "$AC_POWER" -eq 0 ]] && (( _BATT_CURRENT_MA > _SLEEP_CURRENT_LIMIT )); then
+                log_msg "Abnormal current during sleep: ${_BATT_CURRENT_MA}mA (limit ${_SLEEP_CURRENT_LIMIT}mA). Forcing hibernation."
                 hibernate_now
             else
                 # Not enough drain yet, but re-sleep in case of phantom wake like t2 macbook touchbar
                 # handle darkwake here
-                log_msg "Darkwake detected. Waiting 30s to settle before sleep."
+                log_msg "Darkwake detected. Re-applying pmset and waiting 30s to settle."
+                enforce_pmset
                 sleep 30
                 if ! is_full_wake; then
-                    pmset sleepnow
+                    sudo pmset sleepnow
                 else
                     log_msg "Aborted re-sleep, display is on (user woke system)."
                 fi
             fi
-        elif [[ "$STATE" == "awake" ]]; then
+        elif [[ "$_STATE" == "awake" ]]; then
            # Display off but we never initiated sleep — lid was closed
            # or system entered darkwake on its own. Force sleep.
            if has_active_tty; then
-               # TTY is actively running, skip forcing manual sleep 
+               # TTY is actively running, skip forcing manual sleep
                # (low battery is already handled above)
                :
            else
                log_msg "Display off and awake with no TTY. Battery: $BATT%. Forcing sleep."
-               BATTERY_AT_SLEEP=$BATT
+               _BATTERY_AT_SLEEP=$BATT
                sleep_now
            fi
         fi
         continue
     elif is_full_wake; then
-        # Display is on, update state to awake
-        wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
-        is_new_wake=false
-        if [[ -n "$wake_sec" ]] && (( wake_sec > LAST_HANDLED_WAKE )); then
-            is_new_wake=true
-            LAST_HANDLED_WAKE=$wake_sec
+        # Display is on, update _state to awake
+        _wake_sec=$(sysctl -n kern.waketime 2>/dev/null | sed 's/{ sec = \([0-9]*\).*/\1/')
+        _is_new_wake=false
+        if [[ -n "$_wake_sec" ]] && (( _wake_sec > _LAST_HANDLED_WAKE )); then
+            _is_new_wake=true
+            _LAST_HANDLED_WAKE=$_wake_sec
         fi
-        if [[ "$STATE" != "awake" ]] || [[ "$is_new_wake" == true ]]; then
+        if [[ "$_STATE" != "awake" ]] || [[ "$_is_new_wake" == true ]]; then
             handle_wake
         fi
     fi
     # Block sleeping if there is an active TTY session and permissions require it
     if has_active_tty; then
+        IDLE=$(get_idle_time)
+        log_msg "Active TTY detected, skipping sleep. IDLE=$IDLE"
         continue
     fi
-    # Idle timeout check
+    IDLE=$(get_idle_time)
+    log_msg "Light path: IDLE=$IDLE wrangler=$(ioreg -n IODisplayWrangler | grep -o 'CurrentPowerState"=[0-9]*')"
+    # Idle timeout check (lid-open idle path)
     if [[ "$IDLE" -gt "$IDLE_TIME_SEC" ]]; then
+        get_battery_level
         log_msg "Idle for $IDLE seconds. Recording battery at $BATT% and sleeping."
-        BATTERY_AT_SLEEP=$BATT
+        _BATTERY_AT_SLEEP=$BATT
         sleep_now
     fi
 done
