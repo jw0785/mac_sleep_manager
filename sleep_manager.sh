@@ -601,7 +601,7 @@ while true; do
         continue
     fi
     IDLE=$(get_idle_time)
-    log_msg "Light path: IDLE=$IDLE wrangler=$(ioreg -n IODisplayWrangler | grep -o 'CurrentPowerState"=[0-9]*')"
+    # log_msg "Light path: IDLE=$IDLE wrangler=$(ioreg -n IODisplayWrangler | grep -o 'CurrentPowerState"=[0-9]*')"
     # Idle timeout check (lid-open idle path)
     if [[ "$IDLE" -gt "$IDLE_TIME_SEC" ]]; then
         get_battery_level
