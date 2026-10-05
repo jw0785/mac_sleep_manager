@@ -295,8 +295,8 @@ enforce_pmset() {
     sudo pmset -a powernap 0
     sudo pmset -a womp 0
     if [[ "$is_tcp_keepalive" == false ]]; then
-        sudo pmset -a tcpkeepalive 0
-        sudo pmset -a networkoversleep 0
+        sudo pmset -a tcpkeepalive 0 &>/dev/null
+        sudo pmset -a networkoversleep 0 &>/dev/null
     fi
     if [[ "$is_lessbright_allowed" == false ]]; then
         sudo pmset -a lessbright 0
@@ -351,7 +351,7 @@ hibernate_now() {
     pause_media
     stop_caffeinate
     sudo pmset -a standbydelaylow 0
-    sudo pmset -b networkoversleep 0
+    sudo pmset -b networkoversleep 0 &>/dev/null
     sudo pmset -a standbydelayhigh 0
     sudo pmset -a hibernatemode 25
     sudo pmset -b powernap 0
